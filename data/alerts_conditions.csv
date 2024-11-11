@@ -1,0 +1,5 @@
+id,humidity_min,humidity_max,temperature_min,temperature_max,code,message
+1,0,40,-999,-999,101,"It's too dry"
+2,60,100,-999,-999,102,"It's too wet"
+3,-999,-999,-300,30,103,"It's too cold"
+4,-999,-999,40,300,104,"It's too hot"
