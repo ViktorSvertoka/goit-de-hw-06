@@ -1,68 +1,100 @@
-import sys
-import os
+from pyspark.sql import SparkSession
+from pyspark.sql.functions import col, unix_timestamp, window, avg
+from pyspark.streaming import StreamingContext
+from confluent_kafka import Producer, Consumer
 import json
-from confluent_kafka import Producer, Consumer, KafkaException, KafkaError
-from pyflink.datastream import StreamExecutionEnvironment
-from pyflink.datastream.connectors import FlinkKafkaConsumer, FlinkKafkaProducer
-from pyflink.common.serialization import SimpleStringSchema
-from pyflink.common import Configuration
-from pyflink.common.typeinfo import Types
+from datetime import datetime
 
-# Установим переменные для Kafka
+# Налаштування Spark
+spark = SparkSession.builder.appName("SensorDataStream").getOrCreate()
+
+ssc = StreamingContext(spark.sparkContext, 10)  # 10 секунд для кожного мікро-інтервалу
+
+# Налаштування Kafka
 KAFKA_BROKER = "localhost:9092"
 INPUT_TOPIC = "sensor_data"
-OUTPUT_TOPIC = "processed_data"
-GROUP_ID = "flink-consumer-group"
+OUTPUT_TOPIC = "sensor_alerts"
+GROUP_ID = "sensor-consumer-group"
 
-# Настройка окружения Flink
-env = StreamExecutionEnvironment.get_execution_environment()
-
-# Настройка Kafka Consumer с использованием confluent_kafka
 consumer_config = {
     "bootstrap.servers": KAFKA_BROKER,
     "group.id": GROUP_ID,
     "auto.offset.reset": "earliest",
 }
 
-# Подключение к Kafka через Flink
-consumer = FlinkKafkaConsumer(
-    topics=INPUT_TOPIC,
-    deserialization_schema=SimpleStringSchema(),
-    properties=consumer_config,
-)
+producer_config = {
+    "bootstrap.servers": KAFKA_BROKER,
+}
+
+# Створення Kafka consumer та producer
+consumer = Consumer(consumer_config)
+producer = Producer(producer_config)
+
+# Читання умов для алертів з CSV
+import pandas as pd
+
+alerts_conditions = pd.read_csv("./data/alerts_conditions.csv")
 
 
-# Пайплайн обработки данных
-def process_data(record):
-    # Преобразование данных (например, в верхний регистр)
-    return record.upper()
+# Функція для обробки потоку
+def process_stream(rdd):
+    if not rdd.isEmpty():
+        # Перетворюємо RDD на DataFrame
+        df = spark.read.json(rdd)
+
+        # Преобразуем время
+        df = df.withColumn("timestamp", unix_timestamp("timestamp").cast("timestamp"))
+
+        # Використовуємо агрегацію з вікном розміром 1 хвилина, з інтервалом 30 секунд
+        agg_df = df.groupBy(window(df.timestamp, "1 minute", "30 seconds")).agg(
+            avg("temperature").alias("t_avg"), avg("humidity").alias("h_avg")
+        )
+
+        # Перевіряємо умови для алертів
+        alerts = []
+        for row in agg_df.collect():
+            for _, condition in alerts_conditions.iterrows():
+                if (
+                    (
+                        condition["temperature_min"] != -999
+                        and row["t_avg"] < condition["temperature_min"]
+                    )
+                    or (
+                        condition["temperature_max"] != -999
+                        and row["t_avg"] > condition["temperature_max"]
+                    )
+                    or (
+                        condition["humidity_min"] != -999
+                        and row["h_avg"] < condition["humidity_min"]
+                    )
+                    or (
+                        condition["humidity_max"] != -999
+                        and row["h_avg"] > condition["humidity_max"]
+                    )
+                ):
+                    alert = {
+                        "window_start": row["window"].start,
+                        "window_end": row["window"].end,
+                        "t_avg": row["t_avg"],
+                        "h_avg": row["h_avg"],
+                        "code": condition["code"],
+                        "message": condition["message"],
+                        "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                    }
+                    alerts.append(alert)
+
+        # Відправка алертів у Kafka
+        for alert in alerts:
+            producer.produce(OUTPUT_TOPIC, value=json.dumps(alert))
+        producer.flush()
 
 
-# Основная логика обработки потока
-stream = env.add_source(consumer)
-processed_stream = stream.map(process_data, output_type=Types.STRING())
+# Читання з Kafka та перетворення на DStream
+stream = ssc.kafkaStream(KAFKA_BROKER, INPUT_TOPIC, consumer_config)
 
-# Настройка Kafka Producer с использованием confluent_kafka
-producer_config = {"bootstrap.servers": KAFKA_BROKER}
+# Обробка потоку
+stream.foreachRDD(process_stream)
 
-
-# Создание Kafka Producer через confluent_kafka
-def send_to_kafka(record):
-    producer = Producer(producer_config)
-
-    # Отправка сообщений в Kafka
-    def delivery_report(err, msg):
-        if err is not None:
-            print("Message delivery failed: {}".format(err))
-        else:
-            print("Message delivered to {} [{}]".format(msg.topic(), msg.partition()))
-
-    producer.produce(OUTPUT_TOPIC, record.encode("utf-8"), callback=delivery_report)
-    producer.flush()
-
-
-# Запись обработанных данных в Kafka
-processed_stream.add_sink(send_to_kafka)
-
-# Запуск процесса
-env.execute("Flink Kafka Stream Processing")
+# Запуск Spark Streaming
+ssc.start()
+ssc.awaitTermination()
