@@ -1,9 +1,15 @@
+import sys
+import os
+
+sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
+
 from confluent_kafka import Producer
 import json
 import time
 import random
 from config import kafka_config
 from colorama import Fore, init
+
 
 # Ініціалізація colorama
 init(autoreset=True)
