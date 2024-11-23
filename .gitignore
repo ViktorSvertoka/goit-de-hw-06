@@ -112,3 +112,5 @@ kafka_2.13-3.9.0
 
 checkpoint
 checkpoints
+
+*.jar
